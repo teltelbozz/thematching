@@ -19,11 +19,12 @@ router.get('/', async (req, res) => {
 
 router.post('/', async (req, res) => {
   const db = req.app.locals.db as Pool;
+  const userId = (req as any).userId ?? null;
   const { title, theme, date_time, venue, location_lat, location_lng, capacity, fee_yen, is_online } = req.body;
   const sql = `INSERT INTO party_slots (host_user_id, title, theme, date_time, venue, location_lat, location_lng, capacity, fee_yen, is_online)
-               VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, $8, coalesce($9,false))
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10,false))
                RETURNING *`;
-  const params = [title, theme, date_time, venue, location_lat, location_lng, capacity, fee_yen, is_online];
+  const params = [userId, title, theme, date_time, venue, location_lat, location_lng, capacity, fee_yen, is_online];
   const { rows } = await db.query(sql, params);
   res.status(201).json(rows[0]);
 });
@@ -39,7 +40,8 @@ router.get('/:slotId', async (req, res) => {
 router.post('/:slotId/join', async (req, res) => {
   const db = req.app.locals.db as Pool;
   const { slotId } = req.params;
-  const userId = 1; // TODO: replace by auth user (LINE)
+  const userId = (req as any).userId;
+  if (!userId) return res.status(401).json({ error: 'unauthenticated' });
   await db.query('INSERT INTO slot_participants (slot_id, user_id, role, status) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING', [slotId, userId, 'guest', 'pending']);
   res.json({ ok: true });
 });

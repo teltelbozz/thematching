@@ -12,7 +12,8 @@ router.get('/:roomId/messages', async (req, res) => {
 router.post('/:roomId/messages', async (req, res) => {
   const db = req.app.locals.db as Pool;
   const { roomId } = req.params;
-  const userId = 1; // TODO: from auth
+  const userId = (req as any).userId;
+  if (!userId) return res.status(401).json({ error: 'unauthenticated' });
   const { body } = req.body;
   const { rows } = await db.query(`INSERT INTO messages (room_id, user_id, body) VALUES ($1,$2,$3) RETURNING *`, [roomId, userId, body]);
   res.status(201).json(rows[0]);
