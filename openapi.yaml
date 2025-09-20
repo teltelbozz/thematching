@@ -1,0 +1,35 @@
+openapi: 3.0.3
+info:
+  title: LINE Mini App (The4-like) API
+  version: 0.1.0
+servers:
+  - url: https://your-project.vercel.app/api
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+  /slots:
+    get:
+      summary: List party slots
+    post:
+      summary: Create a party slot
+  /slots/{slotId}:
+    get:
+      summary: Get slot detail
+  /slots/{slotId}/join:
+    post:
+      summary: Join a slot
+  /matches:
+    post:
+      summary: Confirm a match for a slot (admin/batch)
+  /chats/{roomId}/messages:
+    get:
+      summary: List chat messages
+    post:
+      summary: Send a message
+  /reviews:
+    post:
+      summary: Create a review
