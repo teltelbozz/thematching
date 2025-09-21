@@ -25,11 +25,14 @@ async function signSession(uid: number) {
 function readCookie(req: any, name: string): string | undefined {
   const raw = req.headers?.cookie;
   if (!raw) return;
-  const target = raw.split(';').map((s: string) => s.trim()).find((s: string) => s.startsWith(name + '='));
+  const target = raw
+    .split(';')
+    .map((s: string) => s.trim())
+    .find((s: string) => s.startsWith(name + '='));
   return target ? decodeURIComponent(target.split('=')[1]) : undefined;
 }
 
-async function verifySession(token?: string): Promise<number | null> {
+export async function verifySession(token?: string): Promise<number | null> {
   if (!token) return null;
   try {
     const { payload } = await jwtVerify(token, SESSION_SECRET, { algorithms: ['HS256'] });
@@ -50,18 +53,17 @@ router.post('/login', async (req, res) => {
     // 1) LINEのid_tokenを検証
     const { payload } = await jwtVerify(id_token, LINE_JWKS, {
       issuer: LINE_ISSUER,
-      audience: LINE_CHANNEL_ID, // ← チャネルIDで検証
+      audience: LINE_CHANNEL_ID, // ログインチャネルID
     });
 
-    // 2) ユーザー情報を取得（LINEのクレーム）
-    // 参考: https://developers.line.biz/ja/reference/line-login/#verify-id-token
+    // 2) ユーザー情報（LINEのクレーム）
     const lineUserId = String(payload.sub); // 一意
-    const displayName = (payload as any).name || (payload as any)['c_hash'] || 'LINE User';
+    const displayName = (payload as any).name || 'LINE User';
     const picture = (payload as any).picture || null;
 
     const db = req.app.locals.db as Pool;
 
-    // 3) users Upsert（line_user_id基準）
+    // 3) users Upsert（line_user_id 基準）
     const userSql = `
       WITH ins AS (
         INSERT INTO users (line_user_id, email)
@@ -89,10 +91,11 @@ router.post('/login', async (req, res) => {
     `;
     const p = await db.query(profSql, [userId, displayName, picture]);
 
-    // 5) セッションJWTを発行しCookieに保存
+    // 5) セッションJWTを発行し Cookie に保存（クロスサイト対応）
     const token = await signSession(userId);
     res.setHeader('Set-Cookie', [
-      `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}`,
+      // 別ドメイン(frontend ↔ backend)のため SameSite=None; Secure が必須
+      `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${SESSION_TTL_SECONDS}`,
     ]);
 
     return res.status(200).json({
@@ -101,13 +104,13 @@ router.post('/login', async (req, res) => {
       profile: p.rows[0],
     });
   } catch (e: any) {
-    console.error('auth/login failed', e);
+    console.error('auth/login failed', e?.message);
     return res.status(401).json({ error: 'invalid_id_token' });
   }
 });
 
 // ----- GET /auth/me -----
-// Cookieのセッション or Authorization: Bearer で判定
+// Cookie のセッション or Authorization: Bearer で判定
 router.get('/me', async (req, res) => {
   const bearer = String(req.headers['authorization'] || '');
   const tokenFromBearer = bearer.startsWith('Bearer ') ? bearer.slice(7) : undefined;
