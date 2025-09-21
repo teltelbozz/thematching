@@ -50,12 +50,21 @@ router.post('/login', async (req, res) => {
     const { id_token } = req.body || {};
     if (!id_token) return res.status(400).json({ error: 'missing_id_token' });
 
-    // 1) LINEの id_token 検証
-    //    clockTolerance を入れて端末とサーバの時計ズレ（±5分）を許容
-    const { payload, protectedHeader } = await jwtVerify(id_token, LINE_JWKS, {
+    // デバッグ: 受け取ったトークンのexp/iat/nowを確認
+    const parts = String(id_token).split('.');
+    if (parts.length === 3) {
+      try {
+        const payloadStr = Buffer.from(parts[1], 'base64url').toString('utf8');
+        const payload = JSON.parse(payloadStr);
+        const now = Math.floor(Date.now()/1000);
+        console.log('[auth/login dbg]', { exp: payload?.exp, iat: payload?.iat, now });
+      } catch {}
+    }
+
+    const { payload } = await jwtVerify(id_token, LINE_JWKS, {
       issuer: LINE_ISSUER,
-      audience: LINE_CHANNEL_ID, // ログインチャネルIDと一致必須
-      clockTolerance: 300,       // ← ここが追加点（秒）
+      audience: LINE_CHANNEL_ID,
+      clockTolerance: 900, // ← まずは15分（動作確認後は300(5分)へ）
     });
 
     // 2) ユーザー情報（LINEのクレーム）
