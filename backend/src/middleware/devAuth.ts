@@ -2,7 +2,7 @@ import type { Request, Response, NextFunction } from 'express';
 import type { Pool } from 'pg';
 
 export default async function devAuth(req: Request, res: Response, next: NextFunction) {
-  if (process.env.VERCEL_ENV === 'production') return next();
+  // Enabled when DEV_FAKE_AUTH=1 regardless of environment
   if (process.env.DEV_FAKE_AUTH !== '1') return next();
 
   const expectKey = process.env.DEV_FAKE_AUTH_KEY;
@@ -24,6 +24,7 @@ export default async function devAuth(req: Request, res: Response, next: NextFun
   UNION ALL
   SELECT id FROM users WHERE line_user_id = $1
   LIMIT 1`;
+
   const { rows } = await db.query(sql, [lineUserId, email]);
   (req as any).userId = rows[0].id;
   next();
