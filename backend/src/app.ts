@@ -1,16 +1,16 @@
 import express from 'express';
 import cors from 'cors';
 
-// 既存ルータのインポート（プロジェクトの構成に合わせてそのまま）
-import healthRouter from './routes/health';
-import slotsRouter from './routes/slots';
-import matchesRouter from './routes/matches';
-import chatsRouter from './routes/chats';
-import reviewsRouter from './routes/reviews';
-import authRouter from './routes/auth';
+// ★ 重要：ESM では実行時の拡張子 .js を付ける
+import healthRouter from './routes/health.js';
+import slotsRouter from './routes/slots.js';
+import matchesRouter from './routes/matches.js';
+import chatsRouter from './routes/chats.js';
+import reviewsRouter from './routes/reviews.js';
+import authRouter from './routes/auth.js';
 
 // devAuth を使っている場合（存在しない環境ではビルドされないように optional にしてもOK）
-import devAuth from './middleware/devAuth';
+import devAuth from './middleware/devAuth.js';
 
 const app = express();
 
