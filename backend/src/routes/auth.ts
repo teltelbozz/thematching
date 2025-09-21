@@ -10,7 +10,7 @@ const LINE_ISSUER = process.env.LINE_ISSUER || 'https://access.line.me';
 const LINE_CHANNEL_ID = process.env.LINE_CHANNEL_ID!;
 const SESSION_SECRET = new TextEncoder().encode(process.env.SESSION_SECRET || 'dev-secret');
 const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'sid';
-const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 60 * 60 * 24 * 7); // 7d
+const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 60 * 60 * 24 * 7); // 7日
 
 // ----- ユーティリティ -----
 async function signSession(uid: number) {
@@ -50,10 +50,12 @@ router.post('/login', async (req, res) => {
     const { id_token } = req.body || {};
     if (!id_token) return res.status(400).json({ error: 'missing_id_token' });
 
-    // 1) LINEのid_tokenを検証
-    const { payload } = await jwtVerify(id_token, LINE_JWKS, {
+    // 1) LINEの id_token 検証
+    //    clockTolerance を入れて端末とサーバの時計ズレ（±5分）を許容
+    const { payload, protectedHeader } = await jwtVerify(id_token, LINE_JWKS, {
       issuer: LINE_ISSUER,
-      audience: LINE_CHANNEL_ID, // ログインチャネルID
+      audience: LINE_CHANNEL_ID, // ログインチャネルIDと一致必須
+      clockTolerance: 300,       // ← ここが追加点（秒）
     });
 
     // 2) ユーザー情報（LINEのクレーム）
@@ -79,7 +81,7 @@ router.post('/login', async (req, res) => {
     const u = await db.query(userSql, [lineUserId]);
     const userId: number = u.rows[0].id;
 
-    // 4) user_profiles Upsert（初回作成 or 表示名/写真を更新）
+    // 4) user_profiles Upsert（表示名/写真を初期投入 or 更新）
     const profSql = `
       INSERT INTO user_profiles (user_id, nickname, photo_url)
       VALUES ($1, $2, $3)
@@ -94,7 +96,7 @@ router.post('/login', async (req, res) => {
     // 5) セッションJWTを発行し Cookie に保存（クロスサイト対応）
     const token = await signSession(userId);
     res.setHeader('Set-Cookie', [
-      // 別ドメイン(frontend ↔ backend)のため SameSite=None; Secure が必須
+      // frontend と backend が異なるドメインのため SameSite=None; Secure が必須
       `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${SESSION_TTL_SECONDS}`,
     ]);
 
@@ -102,9 +104,23 @@ router.post('/login', async (req, res) => {
       ok: true,
       user: { id: userId, line_user_id: lineUserId },
       profile: p.rows[0],
+      // デバッグ時に役立つ付加情報（本番では外してOK）
+      _dbg: {
+        alg: protectedHeader?.alg,
+        iss: payload?.iss,
+        aud: payload?.aud,
+        exp: payload?.exp,
+        iat: payload?.iat,
+      },
     });
   } catch (e: any) {
-    console.error('auth/login failed', e?.message);
+    // ← ここが「エラー詳細を増やす」追加点
+    console.error(
+      '[auth/login failed]',
+      e?.code || '',
+      e?.name || '',
+      e?.message || e
+    );
     return res.status(401).json({ error: 'invalid_id_token' });
   }
 });
