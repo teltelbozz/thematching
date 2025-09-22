@@ -177,23 +177,33 @@ router.post('/logout', async (req, res) => {
 router.get('/me', async (req, res) => {
   try {
     const token = readBearer(req);
-    if (!token) return res.status(401).json({ error: 'unauthenticated' });
+    if (!token) {
+      console.warn('[auth/me] no Authorization header');
+      return res.status(401).json({ error: 'unauthenticated' });
+    }
     const { payload } = await jwtVerify(token, ACCESS_SECRET, { algorithms: ['HS256'], clockTolerance: 60 });
     const uid = (payload as AccessClaims).uid;
-    if (typeof uid !== 'number') return res.status(401).json({ error: 'unauthenticated' });
+    if (typeof uid !== 'number') {
+      console.warn('[auth/me] invalid uid in access token');
+      return res.status(401).json({ error: 'unauthenticated' });
+    }
+
+    // ここに来ていれば GET は実際に到達している
+    console.log('[auth/me] uid=', uid);
 
     const db = req.app.locals.db as Pool;
-    const sql = `
+    const r = await db.query(`
       SELECT u.id, u.line_user_id,
              p.nickname, p.age, p.gender, p.occupation, p.photo_url, p.photo_masked_url, p.verified_age
       FROM users u
       LEFT JOIN user_profiles p ON p.user_id = u.id
       WHERE u.id = $1
-    `;
-    const r = await db.query(sql, [uid]);
+    `, [uid]);
+
     if (!r.rows[0]) return res.status(404).json({ error: 'not_found' });
     return res.json({ user: r.rows[0] });
-  } catch (e: any) {
+  } catch (e:any) {
+    console.warn('[auth/me] verify failed:', e?.code || '', e?.message || e);
     return res.status(401).json({ error: 'unauthenticated' });
   }
 });
