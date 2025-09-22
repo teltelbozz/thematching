@@ -27,10 +27,10 @@ app.set('trust proxy', 1);
  * - origin はワイルドカード不可（credentials:true と共存できない）
  */
 const corsOptions: cors.CorsOptions = {
-  origin: FRONT_ORIGIN,
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  origin: process.env.FRONT_ORIGIN || 'https://thematching-frontend.vercel.app',
+  credentials: true, // ← refresh/login で Cookie を使うため
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
