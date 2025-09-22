@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import type { Pool } from 'pg';
-import { createRemoteJWKSet, jwtVerify, SignJWT } from 'jose';
+import { createRemoteJWKSet, jwtVerify, SignJWT, JWTPayload } from 'jose';
 
 const router = Router();
 
@@ -8,50 +8,57 @@ const router = Router();
 const LINE_JWKS = createRemoteJWKSet(new URL('https://api.line.me/oauth2/v2.1/certs'));
 const LINE_ISSUER = process.env.LINE_ISSUER || 'https://access.line.me';
 const LINE_CHANNEL_ID = process.env.LINE_CHANNEL_ID!;
-const SESSION_SECRET = new TextEncoder().encode(process.env.SESSION_SECRET || 'dev-secret');
-const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'sid';
-const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 60 * 60 * 24 * 7); // 7d
-const DEBUG_AUTH = process.env.DEBUG_AUTH === '1'; // ← DEBUG 時だけ詳細ログを出す
+const DEBUG_AUTH = process.env.DEBUG_AUTH === '1';
 
-// ===== Utils =====
-async function signSession(uid: number) {
+const ACCESS_TTL_SEC = Number(process.env.ACCESS_TTL_SECONDS || 60 * 10);      // 10分
+const REFRESH_TTL_SEC = Number(process.env.REFRESH_TTL_SECONDS || 60 * 60 * 7); // 7時間(例)
+const ACCESS_SECRET = new TextEncoder().encode(process.env.ACCESS_SECRET || 'dev-access');
+const REFRESH_SECRET = new TextEncoder().encode(process.env.REFRESH_SECRET || 'dev-refresh');
+
+const REFRESH_COOKIE = process.env.REFRESH_COOKIE_NAME || 'rt';
+const COOKIE_BASE = `Path=/; HttpOnly; Secure; SameSite=None`; // 別ドメイン運用前提
+
+// ===== utils =====
+type AccessClaims = JWTPayload & { uid: number };
+type RefreshClaims = JWTPayload & { uid: number, rot?: number }; // rot: rotation counter (シンプル例)
+
+async function signAccess(uid: number) {
   const now = Math.floor(Date.now() / 1000);
-  return await new SignJWT({ uid })
+  return await new SignJWT({ uid } as AccessClaims)
     .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
     .setIssuedAt(now)
-    .setExpirationTime(now + SESSION_TTL_SECONDS)
-    .sign(SESSION_SECRET);
+    .setExpirationTime(now + ACCESS_TTL_SEC)
+    .sign(ACCESS_SECRET);
+}
+
+async function signRefresh(uid: number, rot = 0) {
+  const now = Math.floor(Date.now() / 1000);
+  return await new SignJWT({ uid, rot } as RefreshClaims)
+    .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
+    .setIssuedAt(now)
+    .setExpirationTime(now + REFRESH_TTL_SEC)
+    .sign(REFRESH_SECRET);
+}
+
+function readBearer(req: any): string | undefined {
+  const b = String(req.headers['authorization'] || '');
+  return b.startsWith('Bearer ') ? b.slice(7) : undefined;
 }
 
 function readCookie(req: any, name: string): string | undefined {
   const raw = req.headers?.cookie;
   if (!raw) return;
-  const target = raw
-    .split(';')
-    .map((s: string) => s.trim())
-    .find((s: string) => s.startsWith(name + '='));
+  const target = raw.split(';').map((s: string) => s.trim()).find((s: string) => s.startsWith(name + '='));
   return target ? decodeURIComponent(target.split('=')[1]) : undefined;
 }
 
-export async function verifySession(token?: string): Promise<number | null> {
-  if (!token) return null;
-  try {
-    const { payload } = await jwtVerify(token, SESSION_SECRET, { algorithms: ['HS256'] });
-    const uid = (payload as any).uid;
-    return typeof uid === 'number' ? uid : null;
-  } catch {
-    return null;
-  }
-}
-
-// ===== POST /auth/login =====
-// Body: { id_token: string }
+// ===== /auth/login =====
+// Body: { id_token: string } (LIFF の ID トークン)
 router.post('/login', async (req, res) => {
   try {
     const { id_token } = req.body || {};
     if (!id_token) return res.status(400).json({ error: 'missing_id_token' });
 
-    // --- DEBUG: verify 前にペイロードの中身だけ覗く（署名はまだ検証しない） ---
     if (DEBUG_AUTH) {
       try {
         const [h64, p64] = String(id_token).split('.');
@@ -60,51 +67,27 @@ router.post('/login', async (req, res) => {
         const headerObj = JSON.parse(headerStr);
         const payloadObj = JSON.parse(payloadStr);
         const now = Math.floor(Date.now() / 1000);
-
         console.log('[auth/login expect]', { issuer: LINE_ISSUER, audience: LINE_CHANNEL_ID });
-        console.log('[auth/login dbg:incoming]', {
-          alg: headerObj?.alg,
-          iss: payloadObj?.iss,
-          aud: payloadObj?.aud,
-          sub: payloadObj?.sub,
-          iat: payloadObj?.iat,
-          exp: payloadObj?.exp,
-          now,
-          exp_minus_now: (payloadObj?.exp ?? 0) - now,
+        console.log('[auth/login incoming]', {
+          alg: headerObj?.alg, iss: payloadObj?.iss, aud: payloadObj?.aud,
+          sub: payloadObj?.sub, iat: payloadObj?.iat, exp: payloadObj?.exp,
+          now, exp_minus_now: (payloadObj?.exp ?? 0) - now,
         });
-      } catch (e) {
-        console.warn('[auth/login dbg] failed to decode incoming token payload');
-      }
+      } catch {}
     }
-    // -----------------------------------------------------------------------
 
-    // 1) LINE id_token の署名・クレーム検証（時刻ズレを許容）
-    const { payload, protectedHeader } = await jwtVerify(id_token, LINE_JWKS, {
+    const { payload } = await jwtVerify(id_token, LINE_JWKS, {
       issuer: LINE_ISSUER,
-      audience: LINE_CHANNEL_ID, // ← LINE Login のチャネルIDと一致必須
-      clockTolerance: 300,       // 5分の時計ズレ許容（必要に応じて 900 に一時拡大可）
+      audience: LINE_CHANNEL_ID,
+      clockTolerance: 300, // 5分
     });
 
-    if (DEBUG_AUTH) {
-      console.log('[auth/login dbg:verified]', {
-        alg: protectedHeader?.alg,
-        iss: payload?.iss,
-        aud: payload?.aud,
-        sub: payload?.sub,
-        iat: payload?.iat,
-        exp: payload?.exp,
-      });
-    }
-
-    // 2) ユーザー情報（LINE claims）
-    const lineUserId = String(payload.sub); // 一意のID
+    // Create/Update user (line_user_id 基準)
+    const db = req.app.locals.db as Pool;
+    const lineUserId = String(payload.sub);
     const displayName = (payload as any).name || 'LINE User';
     const picture = (payload as any).picture || null;
 
-    // 3) DB upsert
-    const db = req.app.locals.db as Pool;
-
-    // users upsert（line_user_id 基準）
     const userSql = `
       WITH ins AS (
         INSERT INTO users (line_user_id, email)
@@ -120,57 +103,99 @@ router.post('/login', async (req, res) => {
     const u = await db.query(userSql, [lineUserId]);
     const userId: number = u.rows[0].id;
 
-    // user_profiles upsert（表示名/写真）
     const profSql = `
       INSERT INTO user_profiles (user_id, nickname, photo_url)
       VALUES ($1, $2, $3)
-      ON CONFLICT (user_id)
-      DO UPDATE SET
-        nickname = COALESCE(EXCLUDED.nickname, user_profiles.nickname),
-        photo_url = COALESCE(EXCLUDED.photo_url, user_profiles.photo_url),
-        updated_at = NOW()
+      ON CONFLICT (user_id) DO UPDATE
+        SET nickname = COALESCE(EXCLUDED.nickname, user_profiles.nickname),
+            photo_url = COALESCE(EXCLUDED.photo_url, user_profiles.photo_url),
+            updated_at = NOW()
       RETURNING user_id, nickname, photo_url
     `;
     const p = await db.query(profSql, [userId, displayName, picture]);
 
-    // 4) アプリ用セッションを Cookie へ（クロスサイト対応）
-    const sessionToken = await signSession(userId);
+    // === Issue tokens
+    const access = await signAccess(userId);
+    const refresh = await signRefresh(userId, 0);
+
+    // HttpOnly Refresh Cookie (クロスサイト運用)
     res.setHeader('Set-Cookie', [
-      `${SESSION_COOKIE_NAME}=${encodeURIComponent(sessionToken)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${SESSION_TTL_SECONDS}`,
+      `${REFRESH_COOKIE}=${encodeURIComponent(refresh)}; ${COOKIE_BASE}; Max-Age=${REFRESH_TTL_SEC}`,
     ]);
 
     return res.status(200).json({
       ok: true,
+      access_token: access,
+      token_type: 'Bearer',
+      expires_in: ACCESS_TTL_SEC,
       user: { id: userId, line_user_id: lineUserId },
       profile: p.rows[0],
     });
   } catch (e: any) {
-    // 失敗理由を詳しく出す（Vercel Logs で確認）
     console.error('[auth/login failed]', e?.code || '', e?.name || '', e?.message || e);
     return res.status(401).json({ error: 'invalid_id_token' });
   }
 });
 
-// ===== GET /auth/me =====
-// Cookie セッション or Authorization: Bearer
-router.get('/me', async (req, res) => {
-  const bearer = String(req.headers['authorization'] || '');
-  const tokenFromBearer = bearer.startsWith('Bearer ') ? bearer.slice(7) : undefined;
-  const token = tokenFromBearer || readCookie(req, SESSION_COOKIE_NAME);
-  const uid = await verifySession(token);
-  if (!uid) return res.status(401).json({ error: 'unauthenticated' });
+// ===== /auth/refresh =====
+// Cookie の Refresh から新しい Access を返す（JSON）
+router.post('/refresh', async (req, res) => {
+  try {
+    const rt = readCookie(req, REFRESH_COOKIE);
+    if (!rt) return res.status(401).json({ error: 'no_refresh_token' });
 
-  const db = req.app.locals.db as Pool;
-  const sql = `
-    SELECT u.id, u.line_user_id,
-           p.nickname, p.age, p.gender, p.occupation, p.photo_url, p.photo_masked_url, p.verified_age
-    FROM users u
-    LEFT JOIN user_profiles p ON p.user_id = u.id
-    WHERE u.id = $1
-  `;
-  const r = await db.query(sql, [uid]);
-  if (!r.rows[0]) return res.status(404).json({ error: 'not_found' });
-  return res.json({ user: r.rows[0] });
+    const { payload } = await jwtVerify(rt, REFRESH_SECRET, { algorithms: ['HS256'], clockTolerance: 300 });
+    const uid = (payload as RefreshClaims).uid;
+    if (typeof uid !== 'number') return res.status(401).json({ error: 'invalid_refresh' });
+
+    // （必要ならここで DB 側のリフレッシュ状態チェック/回転検知）
+
+    const access = await signAccess(uid);
+    return res.json({
+      ok: true,
+      access_token: access,
+      token_type: 'Bearer',
+      expires_in: ACCESS_TTL_SEC,
+    });
+  } catch (e: any) {
+    console.error('[auth/refresh failed]', e?.code || '', e?.name || '', e?.message || e);
+    return res.status(401).json({ error: 'refresh_failed' });
+  }
+});
+
+// ===== /auth/logout =====
+// Refresh を失効（簡易版：Cookie を消す）
+router.post('/logout', async (req, res) => {
+  res.setHeader('Set-Cookie', [
+    `${REFRESH_COOKIE}=; ${COOKIE_BASE}; Max-Age=0`,
+  ]);
+  return res.json({ ok: true });
+});
+
+// ===== /auth/me =====
+// Bearer アクセストークンでユーザー情報を返す
+router.get('/me', async (req, res) => {
+  try {
+    const token = readBearer(req);
+    if (!token) return res.status(401).json({ error: 'unauthenticated' });
+    const { payload } = await jwtVerify(token, ACCESS_SECRET, { algorithms: ['HS256'], clockTolerance: 60 });
+    const uid = (payload as AccessClaims).uid;
+    if (typeof uid !== 'number') return res.status(401).json({ error: 'unauthenticated' });
+
+    const db = req.app.locals.db as Pool;
+    const sql = `
+      SELECT u.id, u.line_user_id,
+             p.nickname, p.age, p.gender, p.occupation, p.photo_url, p.photo_masked_url, p.verified_age
+      FROM users u
+      LEFT JOIN user_profiles p ON p.user_id = u.id
+      WHERE u.id = $1
+    `;
+    const r = await db.query(sql, [uid]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'not_found' });
+    return res.json({ user: r.rows[0] });
+  } catch (e: any) {
+    return res.status(401).json({ error: 'unauthenticated' });
+  }
 });
 
 export default router;
