@@ -4,23 +4,21 @@ import { createRemoteJWKSet, jwtVerify, SignJWT, JWTPayload } from 'jose';
 
 const router = Router();
 
-// ===== Settings =====
 const LINE_JWKS = createRemoteJWKSet(new URL('https://api.line.me/oauth2/v2.1/certs'));
 const LINE_ISSUER = process.env.LINE_ISSUER || 'https://access.line.me';
 const LINE_CHANNEL_ID = process.env.LINE_CHANNEL_ID!;
 const DEBUG_AUTH = process.env.DEBUG_AUTH === '1';
 
 const ACCESS_TTL_SEC = Number(process.env.ACCESS_TTL_SECONDS || 60 * 10);      // 10分
-const REFRESH_TTL_SEC = Number(process.env.REFRESH_TTL_SECONDS || 60 * 60 * 7); // 7時間(例)
+const REFRESH_TTL_SEC = Number(process.env.REFRESH_TTL_SECONDS || 60 * 60 * 7); // 7時間 (例)
 const ACCESS_SECRET = new TextEncoder().encode(process.env.ACCESS_SECRET || 'dev-access');
 const REFRESH_SECRET = new TextEncoder().encode(process.env.REFRESH_SECRET || 'dev-refresh');
 
 const REFRESH_COOKIE = process.env.REFRESH_COOKIE_NAME || 'rt';
-const COOKIE_BASE = `Path=/; HttpOnly; Secure; SameSite=None`; // 別ドメイン運用前提
+const COOKIE_BASE = `Path=/; HttpOnly; Secure; SameSite=None`;
 
-// ===== utils =====
-type AccessClaims = JWTPayload & { uid: number };
-type RefreshClaims = JWTPayload & { uid: number, rot?: number }; // rot: rotation counter (シンプル例)
+type AccessClaims = JWTPayload & { uid: number | string };
+type RefreshClaims = JWTPayload & { uid: number | string; rot?: number };
 
 async function signAccess(uid: number) {
   const now = Math.floor(Date.now() / 1000);
@@ -52,8 +50,14 @@ function readCookie(req: any, name: string): string | undefined {
   return target ? decodeURIComponent(target.split('=')[1]) : undefined;
 }
 
+// 文字列/数値どちらでも入ってきうる uid を number に正規化
+function normalizeUid(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Number(v);
+  return null;
+}
+
 // ===== /auth/login =====
-// Body: { id_token: string } (LIFF の ID トークン)
 router.post('/login', async (req, res) => {
   try {
     const { id_token } = req.body || {};
@@ -79,10 +83,9 @@ router.post('/login', async (req, res) => {
     const { payload } = await jwtVerify(id_token, LINE_JWKS, {
       issuer: LINE_ISSUER,
       audience: LINE_CHANNEL_ID,
-      clockTolerance: 300, // 5分
+      clockTolerance: 300,
     });
 
-    // Create/Update user (line_user_id 基準)
     const db = req.app.locals.db as Pool;
     const lineUserId = String(payload.sub);
     const displayName = (payload as any).name || 'LINE User';
@@ -101,7 +104,14 @@ router.post('/login', async (req, res) => {
       LIMIT 1
     `;
     const u = await db.query(userSql, [lineUserId]);
-    const userId: number = u.rows[0].id;
+
+    // ★ ここが重要：DBから返る id を number に正規化
+    const userIdRaw = u.rows[0]?.id;
+    const userId = normalizeUid(userIdRaw);
+    if (userId == null) {
+      console.error('[auth/login] invalid user id from DB:', userIdRaw);
+      return res.status(500).json({ error: 'server_user_id_invalid' });
+    }
 
     const profSql = `
       INSERT INTO user_profiles (user_id, nickname, photo_url)
@@ -114,11 +124,10 @@ router.post('/login', async (req, res) => {
     `;
     const p = await db.query(profSql, [userId, displayName, picture]);
 
-    // === Issue tokens
+    // アクセス/リフレッシュ発行（uid は number）
     const access = await signAccess(userId);
     const refresh = await signRefresh(userId, 0);
 
-    // HttpOnly Refresh Cookie (クロスサイト運用)
     res.setHeader('Set-Cookie', [
       `${REFRESH_COOKIE}=${encodeURIComponent(refresh)}; ${COOKIE_BASE}; Max-Age=${REFRESH_TTL_SEC}`,
     ]);
@@ -138,19 +147,18 @@ router.post('/login', async (req, res) => {
 });
 
 // ===== /auth/refresh =====
-// Cookie の Refresh から新しい Access を返す（JSON）
 router.post('/refresh', async (req, res) => {
   try {
     const rt = readCookie(req, REFRESH_COOKIE);
     if (!rt) return res.status(401).json({ error: 'no_refresh_token' });
 
     const { payload } = await jwtVerify(rt, REFRESH_SECRET, { algorithms: ['HS256'], clockTolerance: 300 });
-    const uid = (payload as RefreshClaims).uid;
-    if (typeof uid !== 'number') return res.status(401).json({ error: 'invalid_refresh' });
+    const uidNorm = normalizeUid((payload as RefreshClaims).uid);
+    if (uidNorm == null) return res.status(401).json({ error: 'invalid_refresh_uid' });
 
-    // （必要ならここで DB 側のリフレッシュ状態チェック/回転検知）
+    // （必要ならここでリフレッシュの失効/回転チェック）
 
-    const access = await signAccess(uid);
+    const access = await signAccess(uidNorm);
     return res.json({
       ok: true,
       access_token: access,
@@ -164,8 +172,7 @@ router.post('/refresh', async (req, res) => {
 });
 
 // ===== /auth/logout =====
-// Refresh を失効（簡易版：Cookie を消す）
-router.post('/logout', async (req, res) => {
+router.post('/logout', async (_req, res) => {
   res.setHeader('Set-Cookie', [
     `${REFRESH_COOKIE}=; ${COOKIE_BASE}; Max-Age=0`,
   ]);
@@ -173,7 +180,6 @@ router.post('/logout', async (req, res) => {
 });
 
 // ===== /auth/me =====
-// Bearer アクセストークンでユーザー情報を返す
 router.get('/me', async (req, res) => {
   try {
     const token = readBearer(req);
@@ -182,27 +188,27 @@ router.get('/me', async (req, res) => {
       return res.status(401).json({ error: 'unauthenticated' });
     }
     const { payload } = await jwtVerify(token, ACCESS_SECRET, { algorithms: ['HS256'], clockTolerance: 60 });
-    const uid = (payload as AccessClaims).uid;
-    if (typeof uid !== 'number') {
-      console.warn('[auth/me] invalid uid in access token');
+    const uidNorm = normalizeUid((payload as AccessClaims).uid);
+    if (uidNorm == null) {
+      console.warn('[auth/me] invalid uid in access token:', (payload as any).uid);
       return res.status(401).json({ error: 'unauthenticated' });
     }
 
-    // ここに来ていれば GET は実際に到達している
-    console.log('[auth/me] uid=', uid);
+    console.log('[auth/me] uid=', uidNorm);
 
     const db = req.app.locals.db as Pool;
-    const r = await db.query(`
-      SELECT u.id, u.line_user_id,
-             p.nickname, p.age, p.gender, p.occupation, p.photo_url, p.photo_masked_url, p.verified_age
-      FROM users u
-      LEFT JOIN user_profiles p ON p.user_id = u.id
-      WHERE u.id = $1
-    `, [uid]);
+    const r = await db.query(
+      `SELECT u.id, u.line_user_id,
+              p.nickname, p.age, p.gender, p.occupation, p.photo_url, p.photo_masked_url, p.verified_age
+       FROM users u
+       LEFT JOIN user_profiles p ON p.user_id = u.id
+       WHERE u.id = $1`,
+      [uidNorm]
+    );
 
     if (!r.rows[0]) return res.status(404).json({ error: 'not_found' });
     return res.json({ user: r.rows[0] });
-  } catch (e:any) {
+  } catch (e: any) {
     console.warn('[auth/me] verify failed:', e?.code || '', e?.message || e);
     return res.status(401).json({ error: 'unauthenticated' });
   }
